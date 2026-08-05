@@ -53,7 +53,7 @@ jobs:
             bash -euxo pipefail -c '
               # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
               # master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）和 glslangValidator
-              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++
+              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++ libvulkan-dev
               # Debian 的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装
               git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
               cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
@@ -66,6 +66,8 @@ jobs:
               # NDK sysroot 只有 vulkan.h（C 头），缺 vulkan.hpp（C++ 头，Vulkan-Hpp）
               # → 纯头文件库，克隆下来 -I 指给编译器即可
               git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Hpp.git /tmp/vulkan-hpp
+              # 双保险验证：vulkan.hpp 必须真实存在于某个 -I 路径下
+              ls -l /tmp/vulkan-hpp/include/vulkan/vulkan.hpp /usr/include/vulkan/vulkan.hpp
               git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
@@ -75,7 +77,7 @@ jobs:
                 -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
                 -DSPIRV-Headers_DIR="$SPIRV_DIR" \
                 -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
-                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/vulkan-hpp/include"
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/vulkan-hpp/include -I/usr/include"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
