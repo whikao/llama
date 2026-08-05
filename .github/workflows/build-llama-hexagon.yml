@@ -52,13 +52,17 @@ jobs:
             ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
             bash -euxo pipefail -c '
               # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
-              apt-get update -qq && apt-get install -y -qq glslc
+              # master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）和 glslangValidator
+              apt-get update -qq && apt-get install -y -qq glslc glslang-tools spirv-headers
               git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
               # 改启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
+              # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
               cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
-                -DGGML_OPENCL=OFF -DGGML_VULKAN=ON
+                -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
+                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
