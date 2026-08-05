@@ -53,7 +53,7 @@ jobs:
             bash -euxo pipefail -c '
               # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
               # master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）和 glslangValidator
-              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++ libvulkan-dev
+              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++
               # Debian 的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装
               git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
               cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
@@ -64,12 +64,11 @@ jobs:
               SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
               echo "SPIRV-Headers config: $SPIRV_DIR"
               # NDK sysroot 只有 vulkan.h（C 头），缺 vulkan.hpp（C++ 头）
-              # libvulkan-dev 有，但不能直接 -I/usr/include（会污染宿主 glibc 头）
-              # → 只把 vulkan 相关头拷到隔离目录，-I 指它
-              mkdir -p /tmp/vkinclude
-              cp -r /usr/include/vulkan /tmp/vkinclude/
-              cp -r /usr/include/vk_video /tmp/vkinclude/ 2>/dev/null || true
-              ls -l /tmp/vkinclude/vulkan/vulkan.hpp
+              # → 克隆 Vulkan-Headers 仓库（whisper.cpp 同款验证路径，vulkan.hpp 在里面）
+              #   注意不是 Vulkan-Hpp（那是生成器仓库，浅克隆没有现成头文件）
+              git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
+              ls -l /tmp/Vulkan-Headers/include/vulkan/vulkan.hpp
+              # SPIRV-Headers 装在 /usr/local/include，交叉编译不搜 → -I 补上（该目录只有 spirv 头，无污染）
               git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
@@ -79,7 +78,7 @@ jobs:
                 -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
                 -DSPIRV-Headers_DIR="$SPIRV_DIR" \
                 -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
-                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/vkinclude"
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
