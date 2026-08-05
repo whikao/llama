@@ -36,7 +36,7 @@ jobs:
     steps:
       - name: 拉取 llama.cpp 源码
         run: |
-          REF="${{ github.event.inputs.llama_ref }}"
+          REF="$(echo '${{ github.event.inputs.llama_ref }}' | tr -d '[:space:]')"
           if [ -z "$REF" ]; then
             git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
           else
@@ -52,7 +52,10 @@ jobs:
             ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
             bash -euxo pipefail -c '
               cp docs/backend/snapdragon/CMakeUserPresets.json .
-              cmake --preset arm64-android-snapdragon-release -B build-snapdragon
+              # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
+              # 改启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
+                -DGGML_OPENCL=OFF -DGGML_VULKAN=ON
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
