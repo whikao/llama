@@ -51,6 +51,9 @@ jobs:
             -v "$PWD/llama.cpp":/workspace -w /workspace \
             ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
             bash -euxo pipefail -c '
+              # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
+              apt-get update -qq && apt-get install -y -qq glslc
+              git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
               # 改启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
@@ -79,10 +82,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: llama-snapdragon-latest
-          name: llama.cpp snapdragon (CPU+OpenCL+Hexagon) ${{ env.LLAMA_COMMIT }}
+          name: llama.cpp snapdragon (CPU+Vulkan+Hexagon) ${{ env.LLAMA_COMMIT }}
           body: |
             llama.cpp commit: ${{ env.LLAMA_COMMIT }}
-            后端：CPU / Adreno OpenCL / Hexagon HTP（v73/v75/v79/v81）
+            后端：CPU / Adreno Vulkan / Hexagon HTP（v73/v75/v79/v81）
             Termux 侧用 setup.sh 一键下载解压本资产。
           files: llama-snapdragon.tar.gz
           prerelease: true
