@@ -53,7 +53,7 @@ jobs:
             bash -euxo pipefail -c '
               # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
               # master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）和 glslangValidator
-              apt-get update -qq && apt-get install -y -qq glslc glslang-tools
+              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++
               # Debian 的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装
               git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
               cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
