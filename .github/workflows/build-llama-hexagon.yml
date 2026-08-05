@@ -59,6 +59,10 @@ jobs:
               cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
                 -DCMAKE_INSTALL_PREFIX=/usr/local > /dev/null
               cmake --install /tmp/spirv-headers/build > /dev/null
+              # 交叉编译时 find_package 只搜 Android sysroot，找不到 /usr/local
+              # → 显式定位 config 目录传给主构建
+              SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
+              echo "SPIRV-Headers config: $SPIRV_DIR"
               git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
@@ -66,6 +70,7 @@ jobs:
               # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
               cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
                 -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
+                -DSPIRV-Headers_DIR="$SPIRV_DIR" \
                 -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
                 -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
               cmake --build build-snapdragon -j"$(nproc)"
