@@ -64,8 +64,12 @@ jobs:
               SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
               echo "SPIRV-Headers config: $SPIRV_DIR"
               # NDK sysroot 只有 vulkan.h（C 头），缺 vulkan.hpp（C++ 头）
-              # → libvulkan-dev 已提供 /usr/include/vulkan/vulkan.hpp，验证存在
-              ls -l /usr/include/vulkan/vulkan.hpp
+              # libvulkan-dev 有，但不能直接 -I/usr/include（会污染宿主 glibc 头）
+              # → 只把 vulkan 相关头拷到隔离目录，-I 指它
+              mkdir -p /tmp/vkinclude
+              cp -r /usr/include/vulkan /tmp/vkinclude/
+              cp -r /usr/include/vk_video /tmp/vkinclude/ 2>/dev/null || true
+              ls -l /tmp/vkinclude/vulkan/vulkan.hpp
               git config --global --add safe.directory /workspace
               cp docs/backend/snapdragon/CMakeUserPresets.json .
               # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
@@ -75,7 +79,7 @@ jobs:
                 -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
                 -DSPIRV-Headers_DIR="$SPIRV_DIR" \
                 -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
-                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/usr/include"
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/vkinclude"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
