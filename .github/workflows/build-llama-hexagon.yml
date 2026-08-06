@@ -10,6 +10,9 @@
 #
 # 构建环境：官方 snapdragon-toolchain Docker 镜像（内置 Android NDK +
 #           OpenCL SDK + Hexagon SDK，无需高通账号，无需任何 secret）
+#
+# 2026-08 新增 patch_mode：在拉取源码后、Docker 编译前给 ggml-hexagon 打
+#           HMX/诊断补丁（锚点找不到会显式失败，不会白编）
 # ============================================================
 
 name: build-llama-hexagon
@@ -26,6 +29,20 @@ on:
         required: false
         default: 'v0.7'
         # 查看最新 tag: https://github.com/snapdragon-toolchain/arm64-android/pkgs/container/arm64-android
+      patch_mode:
+        description: 'HMX补丁：none=不打, prof/vdbg=诊断, hmxdbg2=定位decode回退(先跑), hmxfix2=全放开(A/B测速), nospin=省电'
+        type: choice
+        options:
+          - none
+          - prof
+          - vdbg
+          - hmxdbg
+          - hmxfix
+          - hmxdbg2
+          - hmxfix2
+          - nospin
+        default: 'none'
+        required: true
 
 permissions:
   contents: write   # 用于发布 Release
@@ -44,6 +61,141 @@ jobs:
             cd llama.cpp && git checkout "$REF" && cd ..
           fi
           cd llama.cpp && echo "LLAMA_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # ===================== 补丁 step（Docker 编译之前） =====================
+      - name: 打 HMX/诊断补丁 (patch_mode=${{ inputs.patch_mode }})
+        run: |
+          cd llama.cpp
+          python3 - << 'EOF'
+          mode = "${{ inputs.patch_mode }}"
+
+          if mode == "none":
+              print("patch_mode=none，跳过补丁")
+              raise SystemExit(0)
+
+          if mode == "nospin":
+              # nospin: ggml 线程池默认 poll=50(混合自旋)，空闲时自旋烧电。
+              # 改为环境变量 GGML_THREADPOLL 控制：设 0 = 直接睡眠。
+              gpath = "ggml/src/ggml.c"
+              gsrc = open(gpath).read()
+              p_old = "    p->poll       = 50;    // hybrid-polling enabled"
+              p_new = ("    p->poll       = 50;    // hybrid-polling enabled\n"
+                       "    {\n"
+                       "        // SM8850 nospin: env GGML_THREADPOLL overrides polling level\n"
+                       "        const char * tp_env = getenv(\"GGML_THREADPOLL\");\n"
+                       "        if (tp_env) {\n"
+                       "            p->poll = (uint32_t) atoi(tp_env);\n"
+                       "        }\n"
+                       "    }")
+              if gsrc.count(p_old) != 1:
+                  print("ERROR: nospin anchor (poll=50) not found, abort!")
+                  raise SystemExit(1)
+              open(gpath, "w").write(gsrc.replace(p_old, p_new))
+              print("OK: nospin poll env override applied")
+              raise SystemExit(0)
+
+          if mode == "vdbg":
+              # vdbg: GGML_LOG_DEBUG -> INFO，使 GGML_HEXAGON_VERBOSE=2
+              # 能打印 execute-op / htp-tensor / op-queue 等 per-op 明细
+              import glob
+              nfiles = 0
+              nlines = 0
+              for f in glob.glob("ggml/src/ggml-hexagon/**/*.c*", recursive=True):
+                  s = open(f).read()
+                  n = s.count("GGML_LOG_DEBUG")
+                  if n:
+                      open(f, "w").write(s.replace("GGML_LOG_DEBUG", "GGML_LOG_INFO"))
+                      nfiles += 1
+                      nlines += n
+              print("OK: vdbg promoted GGML_LOG_DEBUG -> GGML_LOG_INFO in %d files (%d sites)" % (nfiles, nlines))
+              if nfiles == 0:
+                  print("ERROR: vdbg found no GGML_LOG_DEBUG sites, abort!")
+                  raise SystemExit(1)
+              raise SystemExit(0)
+
+          if mode == "prof":
+              # prof: profile 逐算子耗时日志 DEBUG -> INFO（release 构建可见）
+              # 运行时配合 GGML_HEXAGON_PROFILE=3
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
+              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
+              if tsrc.count(t_old) != 2:
+                  print("ERROR: prof anchor count != 2 in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: prof applied to ggml-hexagon.cpp (2 log sites)")
+              raise SystemExit(0)
+
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          if mode in ("hmxfix", "hmxdbg"):
+              # hmxfix: 放宽 HMX 行数门槛 M=4；hmxdbg 附加资格判定日志
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxfix anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmxdbg":
+                  t_old2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n")
+                  t_new2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
+                            "    GGML_LOG_INFO(\"ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\\n\", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmxdbg anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
+          if mode in ("hmxfix2", "hmxdbg2"):
+              # hmxfix2: 门槛全放，llama decode M=1 也走 HMX；hmxdbg2 附加 elig/preok/vtcm 日志
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (llama decode M=1)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxfix2 anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmxdbg2":
+                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
+                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  t_new2 = ("    {\n"
+                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
+                            "        bool preok = false;\n"
+                            "        if (elig) {\n"
+                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
+                            "        }\n"
+                            "        GGML_LOG_INFO(\"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                            "        if (preok) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmxdbg2 anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
+          print("ERROR: unknown patch_mode=" + mode)
+          raise SystemExit(1)
+          EOF
+          echo "=== 补丁验证 ==="
+          grep -n "SM8850 v81\|hmxdbg\|nospin" \
+            llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp llama.cpp/ggml/src/ggml.c 2>/dev/null || true
+      # ===================== 补丁结束 =====================
 
       - name: 在官方工具链容器内构建（Hexagon HTP + OpenCL + CPU）
         run: |
@@ -105,6 +257,7 @@ jobs:
           name: llama.cpp snapdragon (CPU+Vulkan+Hexagon) ${{ env.LLAMA_COMMIT }}
           body: |
             llama.cpp commit: ${{ env.LLAMA_COMMIT }}
+            patch_mode: ${{ inputs.patch_mode }}
             后端：CPU / Adreno Vulkan / Hexagon HTP（v73/v75/v79/v81）
             Termux 侧用 setup.sh 一键下载解压本资产。
           files: llama-snapdragon.tar.gz
