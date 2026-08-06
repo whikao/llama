@@ -175,7 +175,7 @@ jobs:
                             "        if (elig) {\n"
                             "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
                             "        }\n"
-                            "        GGML_LOG_INFO(\"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                            "        fprintf(stderr, \"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
                             "        if (preok) {\n"
                             "            goto finalize;\n"
                             "        }\n"
@@ -184,6 +184,12 @@ jobs:
                       print("ERROR: hmxdbg2 anchor2 not found, abort!")
                       raise SystemExit(1)
                   tsrc = tsrc.replace(t_old2, t_new2)
+
+              # fprintf(stderr) 需要 stdio.h，保险起见没有就补
+              if mode == "hmxdbg2" and ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+                  idx = tsrc.index("#include")
+                  tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
+                  print("note: added #include <stdio.h>")
 
               open(tpath, "w").write(tsrc)
               print("OK: %s applied" % mode)
