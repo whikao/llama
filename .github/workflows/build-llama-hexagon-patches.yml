@@ -1,0 +1,185 @@
+# build-llama-hexagon-patches.yml
+# 用法：把下面两个 step 原样插进你 whikao/llama 现有构建工作流，
+#       位置 = actions/checkout 之后、cmake 编译之前。
+#       并在 workflow_dispatch.inputs 里加 patch_mode 参数（见文件末尾注释）。
+# 补丁全部只动 ggml/src/ggml-hexagon/（与 whisper 那份同一份代码），
+# 锚点找不到会显式 abort，不会白编。
+#
+# patch_mode 说明：
+#   none     不打补丁（对照组）
+#   prof     诊断：逐算子耗时日志可见，运行时配合 GGML_HEXAGON_PROFILE=3
+#   vdbg     诊断：per-op 执行明细可见，配合 GGML_HEXAGON_VERBOSE=2
+#   hmxdbg   hmxfix + 打印每个 matmul 的 m/资格判定（看 decode 是否被门槛拦）
+#   hmxfix   放宽 HMX 行数门槛：M=4 也走 HMX
+#   hmxdbg2  hmxfix2 + 打印 elig/preok/vtcm（定位 HMX 回退原因，推荐先跑这个）
+#   hmxfix2  彻底放开门槛：decode M=1 也走 HMX（试验，必须 A/B 测速）
+#   nospin   线程池自旋改为 GGML_THREADPOLL 环境变量控制（省电，GGML_THREADPOLL=0）
+
+      - name: 打补丁 A 组 HMX/诊断 (patch_mode=${{ inputs.patch_mode }})
+        run: |
+          python3 - << 'EOF'
+          mode = "${{ inputs.patch_mode }}"
+
+          if mode == "none":
+              print("patch_mode=none，跳过补丁")
+              raise SystemExit(0)
+
+          if mode == "nospin":
+              # nospin: ggml 线程池默认 poll=50(混合自旋)，空闲时自旋烧电。
+              # 改为环境变量 GGML_THREADPOLL 控制：设 0 = 直接睡眠。
+              gpath = "ggml/src/ggml.c"
+              gsrc = open(gpath).read()
+              p_old = "    p->poll       = 50;    // hybrid-polling enabled"
+              p_new = ("    p->poll       = 50;    // hybrid-polling enabled\n"
+                       "    {\n"
+                       "        // SM8850 nospin: env GGML_THREADPOLL overrides polling level\n"
+                       "        const char * tp_env = getenv(\"GGML_THREADPOLL\");\n"
+                       "        if (tp_env) {\n"
+                       "            p->poll = (uint32_t) atoi(tp_env);\n"
+                       "        }\n"
+                       "    }")
+              if gsrc.count(p_old) != 1:
+                  print("ERROR: nospin anchor (poll=50) not found, abort!")
+                  raise SystemExit(1)
+              open(gpath, "w").write(gsrc.replace(p_old, p_new))
+              print("OK: nospin poll env override applied")
+              raise SystemExit(0)
+
+          if mode == "vdbg":
+              # vdbg: GGML_LOG_DEBUG -> INFO，使 GGML_HEXAGON_VERBOSE=2
+              # 能打印 execute-op / htp-tensor / op-queue 等 per-op 明细
+              import glob
+              nfiles = 0
+              nlines = 0
+              for f in glob.glob("ggml/src/ggml-hexagon/**/*.c*", recursive=True):
+                  s = open(f).read()
+                  n = s.count("GGML_LOG_DEBUG")
+                  if n:
+                      open(f, "w").write(s.replace("GGML_LOG_DEBUG", "GGML_LOG_INFO"))
+                      nfiles += 1
+                      nlines += n
+              print("OK: vdbg promoted GGML_LOG_DEBUG -> GGML_LOG_INFO in %d files (%d sites)" % (nfiles, nlines))
+              if nfiles == 0:
+                  print("ERROR: vdbg found no GGML_LOG_DEBUG sites, abort!")
+                  raise SystemExit(1)
+              raise SystemExit(0)
+
+          if mode == "prof":
+              # prof: profile 逐算子耗时日志 DEBUG -> INFO（release 构建可见）
+              # 运行时配合 GGML_HEXAGON_PROFILE=3
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
+              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
+              if tsrc.count(t_old) != 2:
+                  print("ERROR: prof anchor count != 2 in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: prof applied to ggml-hexagon.cpp (2 log sites)")
+              raise SystemExit(0)
+
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          if mode in ("hmxfix", "hmxdbg"):
+              # hmxfix: 放宽 HMX 行数门槛 M=4；hmxdbg 附加资格判定日志
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxfix anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmxdbg":
+                  t_old2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n")
+                  t_new2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
+                            "    GGML_LOG_INFO(\"ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\\n\", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmxdbg anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
+          if mode in ("hmxfix2", "hmxdbg2"):
+              # hmxfix2: 门槛全放，decode M=1 也走 HMX；hmxdbg2 附加 elig/preok/vtcm 日志
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (llama decode M=1)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxfix2 anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmxdbg2":
+                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
+                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  t_new2 = ("    {\n"
+                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
+                            "        bool preok = false;\n"
+                            "        if (elig) {\n"
+                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
+                            "        }\n"
+                            "        GGML_LOG_INFO(\"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                            "        if (preok) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmxdbg2 anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
+          print("ERROR: unknown patch_mode=" + mode)
+          raise SystemExit(1)
+          EOF
+          echo "=== 补丁验证 ==="
+          grep -n "SM8850 v81: HMX\|SM8850 v81: allow\|hmxdbg\|nospin" \
+            ggml/src/ggml-hexagon/ggml-hexagon.cpp ggml/src/ggml.c 2>/dev/null || true
+
+# ============================================================
+# 在 workflow_dispatch.inputs 里加上这个参数（替换原来的 whisper_branch 说明）：
+#
+#   workflow_dispatch:
+#     inputs:
+#       llama_branch:
+#         description: 'llama.cpp branch'
+#         default: 'master'
+#         required: true
+#       patch_mode:
+#         description: 'HMX补丁：prof/vdbg=诊断, hmxdbg2=定位decode回退(先跑), hmxfix2=全放开(A/B测速)'
+#         type: choice
+#         options:
+#           - none
+#           - prof
+#           - vdbg
+#           - hmxdbg
+#           - hmxfix
+#           - hmxdbg2
+#           - hmxfix2
+#           - nospin
+#         default: 'hmxdbg2'
+#         required: true
+#
+# checkout 步骤的 repository 改为：
+#   repository: 'ggml-org/llama.cpp'
+#   ref: ${{ github.event.inputs.llama_branch }}
+#   submodules: recursive
+#
+# 手机端测速方法（构建换上后）：
+#   诊断版(hmxdbg2/prof/vdbg):
+#     GGML_HEXAGON_VERBOSE=2 GGML_HEXAGON_PROFILE=3 \
+#     $LLAMA_HOME/bin/llama-cli -m 模型.gguf --device HTP0 -ngl 99 \
+#       -c 512 -n 64 --no-conversation --no-warmup -p "你好" 2>&1 | tail -40
+#   速度对比(hmxfix2 vs none)：同一命令看末尾 eval time 的 t/s
+# ============================================================
