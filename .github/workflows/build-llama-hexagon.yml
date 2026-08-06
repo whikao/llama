@@ -77,8 +77,8 @@ jobs:
               cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
                 -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
                 -DSPIRV-Headers_DIR="$SPIRV_DIR" \
-                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
-                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2 -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
+                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
             '
