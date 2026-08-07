@@ -1,0 +1,202 @@
+# ============================================================
+# build-llama-hexagon.yml （JZ 后端版）
+# llama.cpp Snapdragon 全后端构建（CPU + Adreno Vulkan + Hexagon HTP NPU）
+# 放在仓库 .github/workflows/ 下，Actions 页手动点 "Run workflow" 触发
+#
+# 与原版差异（backend=jz 时）：
+#   1. 拉取 ggml-org master 后 fetch PR #26373（zhouwg JZ 后端）并 checkout
+#   2. cmake 增加 -DGGML_HEXAGON_JZ=ON -DHTP_ARCH_VERSION=v81
+#   3. patch_mode 强制 none（hmxfix2 锚点只存在于官方后端源码，
+#      JZ 后端是独立实现 ggml-hexagon-jz.cpp，打官方补丁会失败）
+#
+# JZ 后端实测（作者数据，Snapdragon 8 Elite）：GQA 模型 TG 1.1x-1.9x 于官方后端
+# ============================================================
+
+name: build-llama-hexagon
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp 分支/tag/commit（留空 = master 最新）'
+        required: false
+        default: ''
+      toolchain_tag:
+        description: 'snapdragon-toolchain 镜像 tag'
+        required: false
+        default: 'v0.7'
+      backend:
+        description: 'hexagon 后端：qcom=官方, jz=PR#26373 替代后端(TG快1.1-1.9x)'
+        type: choice
+        options:
+          - qcom
+          - jz
+        default: 'jz'
+        required: true
+      patch_mode:
+        description: 'HMX补丁（仅 backend=qcom 有效；jz 强制跳过）：hmxfix2=全放开, none=不打'
+        type: choice
+        options:
+          - none
+          - hmxdbg2
+          - hmxfix2
+        default: 'none'
+        required: true
+
+permissions:
+  contents: write   # 用于发布 Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取 llama.cpp 源码
+        run: |
+          REF="$(echo '${{ github.event.inputs.llama_ref }}' | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
+          else
+            git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
+            cd llama.cpp && git checkout "$REF" && cd ..
+          fi
+          # JZ 后端：取 PR #26373 分支
+          if [ "${{ inputs.backend }}" = "jz" ]; then
+            cd llama.cpp
+            git fetch origin pull/26373/head:pr26373
+            git checkout pr26373
+            cd ..
+          fi
+          cd llama.cpp && echo "LLAMA_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # ===================== 补丁 step（Docker 编译之前） =====================
+      - name: 打 HMX/诊断补丁 (patch_mode=${{ inputs.patch_mode }}, backend=${{ inputs.backend }})
+        run: |
+          cd llama.cpp
+          python3 - << 'EOF'
+          mode = "${{ inputs.patch_mode }}"
+          backend = "${{ inputs.backend }}"
+
+          if backend == "jz":
+              print("backend=jz，跳过官方后端补丁（JZ 为独立实现）")
+              raise SystemExit(0)
+
+          if mode == "none":
+              print("patch_mode=none，跳过补丁")
+              raise SystemExit(0)
+
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          if mode in ("hmxfix2", "hmxdbg2"):
+              # hmxfix2: 门槛全放，llama decode M=1 也走 HMX；hmxdbg2 附加 elig/preok/vtcm 日志
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (llama decode M=1)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxfix2 anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmxdbg2":
+                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
+                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  t_new2 = ("    {\n"
+                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
+                            "        bool preok = false;\n"
+                            "        if (elig) {\n"
+                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
+                            "        }\n"
+                            "        fprintf(stderr, \"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                            "        if (preok) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmxdbg2 anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+
+              # fprintf(stderr) 需要 stdio.h，保险起见没有就补
+              if mode == "hmxdbg2" and ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+                  idx = tsrc.index("#include")
+                  tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
+                  print("note: added #include <stdio.h>")
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
+          print("ERROR: unknown patch_mode=" + mode)
+          raise SystemExit(1)
+          EOF
+          echo "=== 补丁验证 ==="
+          grep -n "SM8850 v81\|hmxdbg" \
+            llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp 2>/dev/null || true
+      # ===================== 补丁结束 =====================
+
+      - name: 在官方工具链容器内构建（Hexagon HTP + Vulkan + CPU）
+        run: |
+          JZ_FLAGS=""
+          if [ "${{ inputs.backend }}" = "jz" ]; then
+            JZ_FLAGS="-DGGML_HEXAGON_JZ=ON -DHTP_ARCH_VERSION=v81"
+          fi
+          echo "JZ_FLAGS=$JZ_FLAGS"
+          docker run --platform linux/amd64 \
+            -v "$PWD/llama.cpp":/workspace -w /workspace \
+            -e JZ_FLAGS="$JZ_FLAGS" \
+            ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
+            bash -euxo pipefail -c '
+              # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
+              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++
+              git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+              cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
+                -DCMAKE_INSTALL_PREFIX=/usr/local > /dev/null
+              cmake --install /tmp/spirv-headers/build > /dev/null
+              SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
+              echo "SPIRV-Headers config: $SPIRV_DIR"
+              git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
+              ls -l /tmp/Vulkan-Headers/include/vulkan/vulkan.hpp
+              git config --global --add safe.directory /workspace
+              cp docs/backend/snapdragon/CMakeUserPresets.json .
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
+                -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
+                $JZ_FLAGS \
+                -DSPIRV-Headers_DIR="$SPIRV_DIR" \
+                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
+              cmake --build build-snapdragon -j"$(nproc)"
+              cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
+            '
+
+      - name: 打包产物
+        run: |
+          cd llama.cpp/pkg-snapdragon
+          tar czf ../../llama-snapdragon.tar.gz llama.cpp
+          cd ../..
+          ls -lh llama-snapdragon.tar.gz
+          tar tzf llama-snapdragon.tar.gz | grep -E 'bin/llama-(server|mtmd-cli)|libggml-htp' || true
+
+      - name: 上传 Actions artifact（保留 14 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-snapdragon-${{ inputs.backend }}-${{ env.LLAMA_COMMIT }}
+          path: llama-snapdragon.tar.gz
+          retention-days: 14
+
+      - name: 发布/更新 Release（手机端固定下载地址）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llama-snapdragon-latest
+          name: llama.cpp snapdragon (${{ inputs.backend }}) ${{ env.LLAMA_COMMIT }}
+          body: |
+            llama.cpp commit: ${{ env.LLAMA_COMMIT }}
+            backend: ${{ inputs.backend }}（jz = PR #26373 替代 Hexagon 后端）
+            patch_mode: ${{ inputs.patch_mode }}
+            后端：CPU / Adreno Vulkan / Hexagon HTP
+            Termux 侧用 setup.sh 一键下载解压本资产。
+          files: llama-snapdragon.tar.gz
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
