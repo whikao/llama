@@ -42,6 +42,14 @@ on:
           - nospin
         default: 'none'
         required: true
+      with_vulkan:
+        description: 'Vulkan后端：yes=编入(混合调度), no=纯HTP+CPU(排除Vulkan搬运开销)'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+        default: 'yes'
+        required: true
 
 permissions:
   contents: write   # 用于发布 Release
@@ -300,7 +308,9 @@ jobs:
 
       # glslc 已在上一步 apt 装好；master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）
       # Debian 源里的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装到 /usr/local
+      # with_vulkan=no 时整步跳过（不编 Vulkan 后端，纯 HTP+CPU 构建）
       - name: 安装 SPIRV-Headers（cmake config）+ Vulkan-Headers（vulkan.hpp）
+        if: inputs.with_vulkan == 'yes'
         run: |
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
           cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
@@ -324,9 +334,14 @@ jobs:
           # 启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
           # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
           # SPIRV-Headers 装在 /usr/local/include，交叉编译不搜 → -I 补上
+          # with_vulkan=no 时 GGML_VULKAN=OFF，产物无 libggml-vulkan.so（纯 HTP+CPU）
+          if [ "${{ inputs.with_vulkan }}" = "yes" ]; then
+            VK_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=$SPIRV_DIR"
+          else
+            VK_FLAG="-DGGML_VULKAN=OFF"
+          fi
           cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
-            -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
-            -DSPIRV-Headers_DIR="$SPIRV_DIR" \
+            -DGGML_OPENCL=OFF $VK_FLAG \
             -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
             -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
           cmake --build build-snapdragon -j"$(nproc)"
@@ -355,6 +370,7 @@ jobs:
           body: |
             llama.cpp commit: ${{ env.LLAMA_COMMIT }}
             patch_mode: ${{ inputs.patch_mode }}
+            with_vulkan: ${{ inputs.with_vulkan }}（no = 纯 HTP+CPU，无 libggml-vulkan.so）
             后端：CPU / Adreno Vulkan / Hexagon HTP（v73/v75/v79/v81）
             工具链：NDK r28 + Hexagon SDK v6.6.0.0 裸机直链（无 Docker、无 secret）
             Termux 侧用 setup.sh 一键下载解压本资产。
