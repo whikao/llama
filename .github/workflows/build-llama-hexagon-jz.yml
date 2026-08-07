@@ -77,7 +77,22 @@ jobs:
           backend = "${{ inputs.backend }}"
 
           if backend == "jz":
-              print("backend=jz，跳过官方后端补丁（JZ 为独立实现）")
+              # JZ 修复1：skel 搜索路径硬编码 /data/local/tmp（adb 假设），
+              # Termux 无 root 写不进 → 加 GGML_HEXAGON_LIBPATH 环境变量覆盖
+              jpath = "ggml/src/ggml-hexagon/ggml-hexagon-jz.cpp"
+              jsrc = open(jpath).read()
+              j_old = ("static void ggmlhexagon_set_runtime_path(size_t device, const std::string & path) {\n"
+                       "    GGML_UNUSED(device);")
+              j_new = ("static void ggmlhexagon_set_runtime_path(size_t device, const std::string & path_in) {\n"
+                       "    GGML_UNUSED(device);\n"
+                       "    // SM8850 termux: env GGML_HEXAGON_LIBPATH overrides skel search path\n"
+                       "    const char * env_lp = getenv(\"GGML_HEXAGON_LIBPATH\");\n"
+                       "    const std::string path = (env_lp && env_lp[0]) ? std::string(env_lp) : path_in;")
+              if jsrc.count(j_old) != 1:
+                  print("ERROR: jz libpath anchor not found, abort!")
+                  raise SystemExit(1)
+              open(jpath, "w").write(jsrc.replace(j_old, j_new))
+              print("OK: jz GGML_HEXAGON_LIBPATH env override applied")
               raise SystemExit(0)
 
           if mode == "none":
@@ -168,6 +183,13 @@ jobs:
                 -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
               cmake --build build-snapdragon -j"$(nproc)"
               cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
+              # JZ 修复2：JZ 分支漏了 skel 的 install 规则，手动补进 pkg
+              # （DSP skel 是 Hexagon 汇编编的 .so，AP 侧运行时按需 dlopen）
+              if [ -n "$JZ_FLAGS" ]; then
+                ls -l build-snapdragon/bin/libggmldsp-skel-*.so
+                cp build-snapdragon/bin/libggmldsp-skel-*.so pkg-snapdragon/llama.cpp/lib/
+                cp build-snapdragon/bin/ggml-hexagon.cfg pkg-snapdragon/llama.cpp/lib/ 2>/dev/null || true
+              fi
             '
 
       - name: 打包产物
