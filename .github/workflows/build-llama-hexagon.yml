@@ -1,17 +1,19 @@
 # ============================================================
-# build-llama-hexagon.yml
-# llama.cpp Snapdragon 全后端构建（CPU + Adreno OpenCL + Hexagon HTP NPU）
+# build-llama-hexagon.yml  (裸机工具链版)
+# llama.cpp Snapdragon 全后端构建（CPU + Adreno Vulkan + Hexagon HTP NPU）
 # 放在仓库 .github/workflows/ 下，Actions 页手动点 "Run workflow" 触发
 #
 # 产物（Release: llama-snapdragon-latest / Actions artifact）：
 #   llama-snapdragon.tar.gz
 #     ├── bin/  llama-server（自带WebUI+MCP）、llama-mtmd-cli（识图）、llama-cli、llama-bench…
-#     └── lib/  libggml-hexagon.so、libggml-htp-v73/75/79/81.so（NPU skel）、libggml-opencl.so…
+#     └── lib/  libggml-hexagon.so、libggml-htp-v73/75/79/81.so（NPU skel）、libggml-vulkan.so…
 #
-# 构建环境：官方 snapdragon-toolchain Docker 镜像（内置 Android NDK +
-#           OpenCL SDK + Hexagon SDK，无需高通账号，无需任何 secret）
+# 构建环境：ubuntu-latest 裸机
+#   - Android NDK r28        （Google 官方直链，无需高通账号，无需任何 secret）
+#   - Hexagon SDK v6.6.0.0   （snapdragon-toolchain/hexagon-sdk GitHub Release 直链）
+#   与 whisper.cpp 的 build-hexagon.yml 完全同款工具链（已验证可用）。
 #
-# 2026-08 新增 patch_mode：在拉取源码后、Docker 编译前给 ggml-hexagon 打
+# 2026-08 patch_mode：拉取源码后、编译前给 ggml-hexagon 打
 #           HMX/诊断补丁（锚点找不到会显式失败，不会白编）
 # ============================================================
 
@@ -24,13 +26,8 @@ on:
         description: 'llama.cpp 分支/tag/commit（留空 = master 最新）'
         required: false
         default: ''
-      toolchain_tag:
-        description: 'snapdragon-toolchain 镜像 tag'
-        required: false
-        default: 'v0.7'
-        # 查看最新 tag: https://github.com/snapdragon-toolchain/arm64-android/pkgs/container/arm64-android
       patch_mode:
-        description: 'HMX补丁：none=不打, prof/vdbg=诊断, hmxdbg2=定位decode回退(先跑), hmxfix2=全放开(A/B测速), nospin=省电'
+        description: 'HMX补丁：hmx2=门槛4降到2(图里方案,推荐), hmx2dbg=带诊断, hmxfix2=全放开, hmxdbg2=诊断, none/prof/vdbg/nospin'
         type: choice
         options:
           - none
@@ -40,6 +37,8 @@ on:
           - hmxfix
           - hmxdbg2
           - hmxfix2
+          - hmx2
+          - hmx2dbg
           - nospin
         default: 'none'
         required: true
@@ -62,7 +61,7 @@ jobs:
           fi
           cd llama.cpp && echo "LLAMA_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      # ===================== 补丁 step（Docker 编译之前） =====================
+      # ===================== 补丁 step（编译之前） =====================
       - name: 打 HMX/诊断补丁 (patch_mode=${{ inputs.patch_mode }})
         run: |
           cd llama.cpp
@@ -195,6 +194,50 @@ jobs:
               print("OK: %s applied" % mode)
               raise SystemExit(0)
 
+          if mode in ("hmx2", "hmx2dbg"):
+              # 【图里的补丁】HMX 门槛从 4 降到 2：
+              # batched decode m=8/16 本已过门槛，但 m=2/3/4 的小批次仍被拦，
+              # 降到 2 后 m=2~16 的 decode 批次全走 HMX 批量路径。
+              # 介于 hmxfix(=4) 和 hmxfix2(=1) 之间的折中档：
+              # 既覆盖小批次，又避开 m=1 单token时 HMX 启动开销可能不划算的风险。
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 2) { // SM8850 v81: HMX threshold lowered 4 -> 2 (batched decode m=2..16)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmx2 anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              if mode == "hmx2dbg":
+                  # 附加 elig/preok/vtcm 诊断日志（同 hmxdbg2），验证 m=2~16 是否真走上 HMX
+                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
+                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  t_new2 = ("    {\n"
+                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
+                            "        bool preok = false;\n"
+                            "        if (elig) {\n"
+                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
+                            "        }\n"
+                            "        fprintf(stderr, \"ggml-hex: hmx2dbg ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                            "        if (preok) {\n"
+                            "            goto finalize;\n"
+                            "        }\n"
+                            "    }\n")
+                  if tsrc.count(t_old2) != 1:
+                      print("ERROR: hmx2dbg anchor2 not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(t_old2, t_new2)
+                  if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+                      idx = tsrc.index("#include")
+                      tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
+                      print("note: added #include <stdio.h>")
+
+              open(tpath, "w").write(tsrc)
+              print("OK: %s applied" % mode)
+              raise SystemExit(0)
+
           print("ERROR: unknown patch_mode=" + mode)
           raise SystemExit(1)
           EOF
@@ -203,43 +246,91 @@ jobs:
             llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp llama.cpp/ggml/src/ggml.c 2>/dev/null || true
       # ===================== 补丁结束 =====================
 
-      - name: 在官方工具链容器内构建（Hexagon HTP + OpenCL + CPU）
+      # ===================== 裸机工具链（替代 snapdragon-toolchain Docker） =====================
+      # 与 whisper.cpp build-hexagon.yml 同款：NDK r28 + Hexagon SDK v6.6.0.0 直链下载
+      - name: 安装编译依赖工具
         run: |
-          docker run --platform linux/amd64 \
-            -v "$PWD/llama.cpp":/workspace -w /workspace \
-            ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
-            bash -euxo pipefail -c '
-              # glslc 是 ggml-vulkan 的着色器编译器，官方容器没预装 → 现装
-              # master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）和 glslangValidator
-              apt-get update -qq && apt-get install -y -qq glslc glslang-tools make g++
-              # Debian 的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装
-              git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
-              cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
-                -DCMAKE_INSTALL_PREFIX=/usr/local > /dev/null
-              cmake --install /tmp/spirv-headers/build > /dev/null
-              # 交叉编译时 find_package 只搜 Android sysroot，找不到 /usr/local
-              # → 显式定位 config 目录传给主构建
-              SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
-              echo "SPIRV-Headers config: $SPIRV_DIR"
-              # NDK sysroot 只有 vulkan.h（C 头），缺 vulkan.hpp（C++ 头）
-              # → 克隆 Vulkan-Headers 仓库（whisper.cpp 同款验证路径，vulkan.hpp 在里面）
-              #   注意不是 Vulkan-Hpp（那是生成器仓库，浅克隆没有现成头文件）
-              git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
-              ls -l /tmp/Vulkan-Headers/include/vulkan/vulkan.hpp
-              # SPIRV-Headers 装在 /usr/local/include，交叉编译不搜 → -I 补上（该目录只有 spirv 头，无污染）
-              git config --global --add safe.directory /workspace
-              cp docs/backend/snapdragon/CMakeUserPresets.json .
-              # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
-              # 改启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
-              # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
-              cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
-                -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
-                -DSPIRV-Headers_DIR="$SPIRV_DIR" \
-                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
-                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
-              cmake --build build-snapdragon -j"$(nproc)"
-              cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
-            '
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget xz-utils unzip \
+            glslc glslang-tools make g++ python3 git
+
+      - name: 下载并设置 Android NDK r28
+        run: |
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r28-linux.zip
+          unzip -q android-ndk-r28-linux.zip
+          # llama.cpp snapdragon preset / cmake 可能引用其中任意一个变量名，全设上保险
+          echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=/tmp/android-ndk-r28" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk-r28" >> $GITHUB_ENV
+
+      - name: 下载并解压 Hexagon SDK v6.6.0.0
+        run: |
+          cd /tmp
+          wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          # 动态自动定位包含 'incs' 的真实根目录
+          SDK_ROOT=$(find /tmp -maxdepth 3 -type d -name "incs" 2>/dev/null | head -n 1 | xargs dirname)
+          if [ -n "$SDK_ROOT" ]; then
+            echo "HEXAGON_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+            echo "HEXAGON_SDK=$SDK_ROOT" >> $GITHUB_ENV
+            echo "✅ 成功定位 SDK 真实根目录: $SDK_ROOT"
+            TOOLS_PATH=$(find $SDK_ROOT -path "*/HEXAGON_Tools/19.0.07" 2>/dev/null | head -n 1)
+            if [ -n "$TOOLS_PATH" ]; then
+              echo "HEXAGON_TOOLS_ROOT=$TOOLS_PATH" >> $GITHUB_ENV
+              echo "✅ 成功定位 Tools 目录: $TOOLS_PATH"
+            else
+              echo "❌ 错误: 在 SDK 根目录下未发现 HEXAGON_Tools/19.0.07！"
+              exit 1
+            fi
+          else
+            echo "❌ 错误: 解压后未找到包含 'incs' 文件夹的 SDK 目录，请检查解压包！"
+            exit 1
+          fi
+
+      - name: 修复官方 SDK 的 CMake 兼容性问题
+        run: |
+          CMAKE_FILE=$(find /tmp -path "*/build/cmake/hexagon_fun.cmake" 2>/dev/null | head -n 1)
+          if [ -n "$CMAKE_FILE" ]; then
+            sed -i '99,106s/^/# /' "$CMAKE_FILE"
+            echo "✅ 成功修复 CMake 文件: $CMAKE_FILE"
+          else
+            echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
+          fi
+
+      # glslc 已在上一步 apt 装好；master 版 ggml-vulkan 还需要 SPIRV-Headers（cmake 包）
+      # Debian 源里的 spirv-headers 不带 cmake config → 从 Khronos 官方源码安装到 /usr/local
+      - name: 安装 SPIRV-Headers（cmake config）+ Vulkan-Headers（vulkan.hpp）
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+          cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
+            -DCMAKE_INSTALL_PREFIX=/usr/local > /dev/null
+          sudo cmake --install /tmp/spirv-headers/build > /dev/null
+          SPIRV_DIR="$(dirname "$(find /usr/local -name 'SPIRV-HeadersConfig.cmake' | head -1)")"
+          echo "SPIRV_DIR=$SPIRV_DIR" >> $GITHUB_ENV
+          echo "SPIRV-Headers config: $SPIRV_DIR"
+          # NDK sysroot 只有 vulkan.h（C 头），缺 vulkan.hpp（C++ 头）
+          # → 克隆 Vulkan-Headers 仓库（whisper.cpp 同款验证路径，vulkan.hpp 在里面）
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
+          ls -l /tmp/Vulkan-Headers/include/vulkan/vulkan.hpp
+      # ===================== 工具链就绪 =====================
+
+      - name: 构建（Hexagon HTP + Vulkan + CPU）
+        run: |
+          cd llama.cpp
+          git config --global --add safe.directory "$PWD"
+          cp docs/backend/snapdragon/CMakeUserPresets.json .
+          # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
+          # 启用 Vulkan（Adreno 原生驱动，支持卷积，视觉编码器可上 GPU）
+          # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
+          # SPIRV-Headers 装在 /usr/local/include，交叉编译不搜 → -I 补上
+          cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
+            -DGGML_OPENCL=OFF -DGGML_VULKAN=ON \
+            -DSPIRV-Headers_DIR="$SPIRV_DIR" \
+            -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+            -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE -I/tmp/Vulkan-Headers/include -I/usr/local/include"
+          cmake --build build-snapdragon -j"$(nproc)"
+          cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
 
       - name: 打包产物
         run: |
@@ -265,6 +356,7 @@ jobs:
             llama.cpp commit: ${{ env.LLAMA_COMMIT }}
             patch_mode: ${{ inputs.patch_mode }}
             后端：CPU / Adreno Vulkan / Hexagon HTP（v73/v75/v79/v81）
+            工具链：NDK r28 + Hexagon SDK v6.6.0.0 裸机直链（无 Docker、无 secret）
             Termux 侧用 setup.sh 一键下载解压本资产。
           files: llama-snapdragon.tar.gz
           prerelease: true
