@@ -91,8 +91,27 @@ jobs:
               if jsrc.count(j_old) != 1:
                   print("ERROR: jz libpath anchor not found, abort!")
                   raise SystemExit(1)
-              open(jpath, "w").write(jsrc.replace(j_old, j_new))
+              jsrc = jsrc.replace(j_old, j_new)
               print("OK: jz GGML_HEXAGON_LIBPATH env override applied")
+
+              # JZ 修复3：mempool 探测上限 4032MiB，v81 上 dsp_register_ion 失败
+              # (0x80000401)。加 GGML_HEXAGON_POOLMB 环境变量直接指定池大小，
+              # 运行时逐档试（如 3072/2560/2048），定位 DSP 可映射上限
+              p_old = "    size_t probe_counts     = probe_slots.size();"
+              p_new = ("    {\n"
+                       "        // SM8850 v81: env GGML_HEXAGON_POOLMB overrides mempool probe size\n"
+                       "        const char * env_pool = getenv(\"GGML_HEXAGON_POOLMB\");\n"
+                       "        if (env_pool && atoi(env_pool) >= 256) {\n"
+                       "            probe_slots.clear();\n"
+                       "            probe_slots.push_back(atoi(env_pool));\n"
+                       "        }\n"
+                       "    }\n"
+                       "    size_t probe_counts     = probe_slots.size();")
+              if jsrc.count(p_old) != 1:
+                  print("ERROR: jz poolmb anchor not found, abort!")
+                  raise SystemExit(1)
+              open(jpath, "w").write(jsrc.replace(p_old, p_new))
+              print("OK: jz GGML_HEXAGON_POOLMB env override applied")
               raise SystemExit(0)
 
           if mode == "none":
