@@ -27,7 +27,7 @@ on:
         required: false
         default: ''
       patch_mode:
-        description: 'HMX补丁：hmx2=门槛4降到2(图里方案,推荐), hmx2dbg=带诊断, hmxfix2=全放开, hmxdbg2=诊断, none/prof/vdbg/nospin'
+        description: 'HMX补丁：hmxpipe=m=1放行+双缓冲流水开关(图一2/3,推荐), hmx2=门槛降到2, hmxfix2=全放开, none/prof/vdbg/nospin'
         type: choice
         options:
           - none
@@ -39,6 +39,7 @@ on:
           - hmxfix2
           - hmx2
           - hmx2dbg
+          - hmxpipe
           - nospin
         default: 'none'
         required: true
@@ -202,6 +203,34 @@ jobs:
               print("OK: %s applied" % mode)
               raise SystemExit(0)
 
+          if mode == "hmxpipe":
+              # 【图一 方案2+3】m=1 进 HMX + 强制双缓冲异步流水：
+              # (a) 门槛全放（同 hmxfix2），llama decode M=1 走 HMX（M 内部 pad 到 32 tile）
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 1) { // SM8850 hmxpipe: HMX for any M (decode M=1, padded to tile)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxpipe anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              # (b) pipeline 由环境变量 GGML_HMX_PIPELINE 控制（skel 里双缓冲已自带，
+              #     上游门槛 m>32 把它关了；1=强制开, 0=强制关, 不设=上游默认）
+              t_old2 = "    const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);"
+              t_new2 = ("    bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);\n"
+                        "    { // SM8850 hmxpipe: env override for HMX double-buffered pipeline\n"
+                        "        static int f = -2;\n"
+                        "        if (f == -2) { const char * e = getenv(\"GGML_HMX_PIPELINE\"); f = e ? atoi(e) : -1; }\n"
+                        "        if (f >= 0) { pipeline = (f == 1); }\n"
+                        "    }")
+              if tsrc.count(t_old2) != 1:
+                  print("ERROR: hmxpipe anchor2 (pipeline) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: hmxpipe applied (threshold + GGML_HMX_PIPELINE env override)")
+              raise SystemExit(0)
+
           if mode in ("hmx2", "hmx2dbg"):
               # 【图里的补丁】HMX 门槛从 4 降到 2：
               # batched decode m=8/16 本已过门槛，但 m=2/3/4 的小批次仍被拦，
@@ -250,7 +279,7 @@ jobs:
           raise SystemExit(1)
           EOF
           echo "=== 补丁验证 ==="
-          grep -n "SM8850 v81\|hmxdbg\|nospin" \
+          grep -n "SM8850 v81\|SM8850 hmxpipe\|hmxdbg\|nospin" \
             llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp llama.cpp/ggml/src/ggml.c 2>/dev/null || true
       # ===================== 补丁结束 =====================
 
