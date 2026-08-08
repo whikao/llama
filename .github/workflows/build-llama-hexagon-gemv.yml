@@ -1,5 +1,5 @@
 # ============================================================
-# build-llama-hexagon-gemv.yml  (GEMV Tile 实验版 v2 - 无 Vulkan)
+# build-llama-hexagon-gemv.yml  (GEMV Tile 实验版 v3 - 无 Vulkan)
 # llama.cpp Snapdragon 构建（CPU + Hexagon HTP NPU）
 # 纯 HTP+CPU，排除 Vulkan 搬运开销和 GPU 抢资源问题
 # 新增 patch_mode=gemv_tile：把 decode M=1 GEMV 包装成 M=4 batched 走 HMX
@@ -54,274 +54,290 @@ jobs:
       - name: 打补丁 (patch_mode=${{ inputs.patch_mode }})
         run: |
           cd llama.cpp
-          python3 - << 'EOF'
-          mode = "${{ inputs.patch_mode }}"
+          # 把 Python 脚本写到文件再执行，避免 heredoc 转义地狱
+          cat > /tmp/patch.py << 'PYEOF'
+import sys
+mode = sys.argv[1] if len(sys.argv) > 1 else "none"
 
-          if mode == "none":
-              print("patch_mode=none，跳过补丁")
-              raise SystemExit(0)
+if mode == "none":
+    print("patch_mode=none，跳过补丁")
+    sys.exit(0)
 
-          if mode == "nospin":
-              gpath = "ggml/src/ggml.c"
-              gsrc = open(gpath).read()
-              p_old = "    p->poll       = 50;    // hybrid-polling enabled"
-              p_new = ("    p->poll       = 50;    // hybrid-polling enabled\n"
-                       "    {\n"
-                       "        const char * tp_env = getenv(\"GGML_THREADPOLL\");\n"
-                       "        if (tp_env) {\n"
-                       "            p->poll = (uint32_t) atoi(tp_env);\n"
-                       "        }\n"
-                       "    }")
-              if gsrc.count(p_old) != 1:
-                  print("ERROR: nospin anchor not found, abort!")
-                  raise SystemExit(1)
-              open(gpath, "w").write(gsrc.replace(p_old, p_new))
-              print("OK: nospin applied")
-              raise SystemExit(0)
+if mode == "nospin":
+    gpath = "ggml/src/ggml.c"
+    gsrc = open(gpath).read()
+    p_old = "    p->poll       = 50;    // hybrid-polling enabled"
+    p_new = """    p->poll       = 50;    // hybrid-polling enabled
+    {
+        const char * tp_env = getenv("GGML_THREADPOLL");
+        if (tp_env) {
+            p->poll = (uint32_t) atoi(tp_env);
+        }
+    }"""
+    if gsrc.count(p_old) != 1:
+        print("ERROR: nospin anchor not found, abort!")
+        sys.exit(1)
+    open(gpath, "w").write(gsrc.replace(p_old, p_new))
+    print("OK: nospin applied")
+    sys.exit(0)
 
-          if mode == "vdbg":
-              import glob
-              nfiles = 0
-              nlines = 0
-              for f in glob.glob("ggml/src/ggml-hexagon/**/*.c*", recursive=True):
-                  s = open(f).read()
-                  n = s.count("GGML_LOG_DEBUG")
-                  if n:
-                      open(f, "w").write(s.replace("GGML_LOG_DEBUG", "GGML_LOG_INFO"))
-                      nfiles += 1
-                      nlines += n
-              print("OK: vdbg in %d files (%d sites)" % (nfiles, nlines))
-              if nfiles == 0:
-                  print("ERROR: vdbg found no sites, abort!")
-                  raise SystemExit(1)
-              raise SystemExit(0)
+if mode == "vdbg":
+    import glob
+    nfiles = 0
+    nlines = 0
+    for f in glob.glob("ggml/src/ggml-hexagon/**/*.c*", recursive=True):
+        s = open(f).read()
+        n = s.count("GGML_LOG_DEBUG")
+        if n:
+            open(f, "w").write(s.replace("GGML_LOG_DEBUG", "GGML_LOG_INFO"))
+            nfiles += 1
+            nlines += n
+    print("OK: vdbg in %d files (%d sites)" % (nfiles, nlines))
+    if nfiles == 0:
+        print("ERROR: vdbg found no sites, abort!")
+        sys.exit(1)
+    sys.exit(0)
 
-          if mode == "prof":
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
-              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
-              if tsrc.count(t_old) != 2:
-                  print("ERROR: prof anchor count != 2, abort!")
-                  raise SystemExit(1)
-              open(tpath, "w").write(tsrc.replace(t_old, t_new))
-              print("OK: prof applied")
-              raise SystemExit(0)
+if mode == "prof":
+    tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+    tsrc = open(tpath).read()
+    t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
+    t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
+    if tsrc.count(t_old) != 2:
+        print("ERROR: prof anchor count != 2, abort!")
+        sys.exit(1)
+    open(tpath, "w").write(tsrc.replace(t_old, t_new))
+    print("OK: prof applied")
+    sys.exit(0)
 
-          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-          tsrc = open(tpath).read()
+tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+tsrc = open(tpath).read()
 
-          if mode in ("hmxfix", "hmxdbg"):
-              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
-              t_new1 = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
-              if tsrc.count(t_old1) != 1:
-                  print("ERROR: hmxfix anchor1 not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(t_old1, t_new1)
-              if mode == "hmxdbg":
-                  t_old2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
-                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n")
-                  t_new2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
-                            "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
-                            "    GGML_LOG_INFO(\"ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\\n\", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));\n")
-                  if tsrc.count(t_old2) != 1:
-                      print("ERROR: hmxdbg anchor2 not found, abort!")
-                      raise SystemExit(1)
-                  tsrc = tsrc.replace(t_old2, t_new2)
-              open(tpath, "w").write(tsrc)
-              print("OK: %s applied" % mode)
-              raise SystemExit(0)
+if mode in ("hmxfix", "hmxdbg"):
+    t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+    t_new1 = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
+    if tsrc.count(t_old1) != 1:
+        print("ERROR: hmxfix anchor1 not found, abort!")
+        sys.exit(1)
+    tsrc = tsrc.replace(t_old1, t_new1)
+    if mode == "hmxdbg":
+        t_old2 = """    // Check HMX eligibility and try precomputing HMX parameters
+    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+"""
+        t_new2 = """    // Check HMX eligibility and try precomputing HMX parameters
+    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+    GGML_LOG_INFO("ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\n", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));
+"""
+        if tsrc.count(t_old2) != 1:
+            print("ERROR: hmxdbg anchor2 not found, abort!")
+            sys.exit(1)
+        tsrc = tsrc.replace(t_old2, t_new2)
+    open(tpath, "w").write(tsrc)
+    print("OK: %s applied" % mode)
+    sys.exit(0)
 
-          if mode in ("hmxfix2", "hmxdbg2"):
-              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
-              t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (llama decode M=1)"
-              if tsrc.count(t_old1) != 1:
-                  print("ERROR: hmxfix2 anchor1 not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(t_old1, t_new1)
-              if mode == "hmxdbg2":
-                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
-                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
-                            "            goto finalize;\n"
-                            "        }\n"
-                            "    }\n")
-                  t_new2 = ("    {\n"
-                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
-                            "        bool preok = false;\n"
-                            "        if (elig) {\n"
-                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
-                            "        }\n"
-                            "        fprintf(stderr, "ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
-                            "        if (preok) {\n"
-                            "            goto finalize;\n"
-                            "        }\n"
-                            "    }\n")
-                  if tsrc.count(t_old2) != 1:
-                      print("ERROR: hmxdbg2 anchor2 not found, abort!")
-                      raise SystemExit(1)
-                  tsrc = tsrc.replace(t_old2, t_new2)
-                  if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
-                      idx = tsrc.index("#include")
-                      tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
-                      print("note: added #include <stdio.h>")
-              open(tpath, "w").write(tsrc)
-              print("OK: %s applied" % mode)
-              raise SystemExit(0)
+if mode in ("hmxfix2", "hmxdbg2"):
+    t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+    t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (llama decode M=1)"
+    if tsrc.count(t_old1) != 1:
+        print("ERROR: hmxfix2 anchor1 not found, abort!")
+        sys.exit(1)
+    tsrc = tsrc.replace(t_old1, t_new1)
+    if mode == "hmxdbg2":
+        t_old2 = """    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
+            goto finalize;
+        }
+    }
+"""
+        t_new2 = """    {
+        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);
+        bool preok = false;
+        if (elig) {
+            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);
+        }
+        fprintf(stderr, "ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
+        if (preok) {
+            goto finalize;
+        }
+    }
+"""
+        if tsrc.count(t_old2) != 1:
+            print("ERROR: hmxdbg2 anchor2 not found, abort!")
+            sys.exit(1)
+        tsrc = tsrc.replace(t_old2, t_new2)
+        if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+            idx = tsrc.index("#include")
+            tsrc = tsrc[:idx] + "#include <stdio.h>
+" + tsrc[idx:]
+            print("note: added #include <stdio.h>")
+    open(tpath, "w").write(tsrc)
+    print("OK: %s applied" % mode)
+    sys.exit(0)
 
-          if mode in ("hmx2", "hmx2dbg"):
-              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
-              t_new1 = "    if (m < 2) { // SM8850 v81: HMX threshold lowered 4 -> 2 (batched decode m=2..16)"
-              if tsrc.count(t_old1) != 1:
-                  print("ERROR: hmx2 anchor1 not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(t_old1, t_new1)
-              if mode == "hmx2dbg":
-                  t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
-                            "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
-                            "            goto finalize;\n"
-                            "        }\n"
-                            "    }\n")
-                  t_new2 = ("    {\n"
-                            "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
-                            "        bool preok = false;\n"
-                            "        if (elig) {\n"
-                            "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
-                            "        }\n"
-                            "        fprintf(stderr, "ggml-hex: hmx2dbg ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
-                            "        if (preok) {\n"
-                            "            goto finalize;\n"
-                            "        }\n"
-                            "    }\n")
-                  if tsrc.count(t_old2) != 1:
-                      print("ERROR: hmx2dbg anchor2 not found, abort!")
-                      raise SystemExit(1)
-                  tsrc = tsrc.replace(t_old2, t_new2)
-                  if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
-                      idx = tsrc.index("#include")
-                      tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
-                      print("note: added #include <stdio.h>")
-              open(tpath, "w").write(tsrc)
-              print("OK: %s applied" % mode)
-              raise SystemExit(0)
+if mode in ("hmx2", "hmx2dbg"):
+    t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+    t_new1 = "    if (m < 2) { // SM8850 v81: HMX threshold lowered 4 -> 2 (batched decode m=2..16)"
+    if tsrc.count(t_old1) != 1:
+        print("ERROR: hmx2 anchor1 not found, abort!")
+        sys.exit(1)
+    tsrc = tsrc.replace(t_old1, t_new1)
+    if mode == "hmx2dbg":
+        t_old2 = """    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
+            goto finalize;
+        }
+    }
+"""
+        t_new2 = """    {
+        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);
+        bool preok = false;
+        if (elig) {
+            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);
+        }
+        fprintf(stderr, "ggml-hex: hmx2dbg ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
+        if (preok) {
+            goto finalize;
+        }
+    }
+"""
+        if tsrc.count(t_old2) != 1:
+            print("ERROR: hmx2dbg anchor2 not found, abort!")
+            sys.exit(1)
+        tsrc = tsrc.replace(t_old2, t_new2)
+        if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+            idx = tsrc.index("#include")
+            tsrc = tsrc[:idx] + "#include <stdio.h>
+" + tsrc[idx:]
+            print("note: added #include <stdio.h>")
+    open(tpath, "w").write(tsrc)
+    print("OK: %s applied" % mode)
+    sys.exit(0)
 
-          # ===================== GEMV TILE 补丁 v2 =====================
-          if mode == "gemv_tile":
-              print("=== GEMV TILE v2: M=1 decode -> M=4 batched matmul for HMX ===")
+# ===================== GEMV TILE 补丁 v3 =====================
+if mode == "gemv_tile":
+    print("=== GEMV TILE v3: M=1 decode -> M=4 batched matmul for HMX ===")
 
-              # Step 1: 降低 HMX 门槛到 <1，让 M=1 能进 HMX 路径
-              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
-              t_new1 = "    if (m < 1) { // gemv_tile: allow any M including M=1"
-              if tsrc.count(t_old1) != 1:
-                  print("ERROR: gemv_tile anchor1 (HMX threshold) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(t_old1, t_new1)
-              print("OK: HMX threshold lowered to <1")
+    # Step 1: 降低 HMX 门槛到 <1，让 M=1 能进 HMX 路径
+    t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+    t_new1 = "    if (m < 1) { // gemv_tile: allow any M including M=1"
+    if tsrc.count(t_old1) != 1:
+        print("ERROR: gemv_tile anchor1 (HMX threshold) not found, abort!")
+        sys.exit(1)
+    tsrc = tsrc.replace(t_old1, t_new1)
+    print("OK: HMX threshold lowered to <1")
 
-              # Step 2: 在 m/n/k 计算后插入 gemv_tile 检测和 fake M 设置
-              t_old2 = ("    }\n"
-                        "\n"
-                        "    // Check HMX eligibility and try precomputing HMX parameters\n")
+    # Step 2: 在 m/n/k 计算后插入 gemv_tile 检测和 fake M 设置
+    t_old2 = """    }
 
-              if tsrc.count(t_old2) != 1:
-                  t_old2 = ("    }\n"
-                            "\n"
-                            "    // Check HMX eligibility")
-                  if tsrc.count(t_old2) != 1:
-                      print("ERROR: gemv_tile anchor2 (pre-HMX check) not found, abort!")
-                      raise SystemExit(1)
+    // Check HMX eligibility and try precomputing HMX parameters
+"""
 
-              t_new2 = ("    }\n"
-                        "\n"
-                        "    // ===== GEMV TILE PATCH START =====\n"
-                        "    // Detect decode-phase M=1 GEMV and prepare to fake M=4 for HMX\n"
-                        "    bool gemv_tile_mode = false;\n"
-                        "    int  gemv_real_m    = m;\n"
-                        "    if (m == 1 && !is_matmul_id && !is_batched && sess->n_hmx > 0 && opt_mm_select >= 3) {\n"
-                        "        // Single-token decode GEMV: fake as M=4 to pass HMX threshold\n"
-                        "        gemv_tile_mode = true;\n"
-                        "        m = 4;  // fake M for HMX eligibility and precompute\n"
-                        "        GGML_LOG_INFO(\"ggml-hex: gemv_tile ACTIVATED real_m=1 fake_m=4\\n\");\n"
-                        "    }\n"
-                        "    // ===== GEMV TILE PATCH END =====\n"
-                        "\n"
-                        "    // Check HMX eligibility and try precomputing HMX parameters\n")
+    if tsrc.count(t_old2) != 1:
+        t_old2 = """    }
 
-              tsrc = tsrc.replace(t_old2, t_new2)
-              print("OK: gemv_tile detection inserted")
+    // Check HMX eligibility"""
+        if tsrc.count(t_old2) != 1:
+            print("ERROR: gemv_tile anchor2 (pre-HMX check) not found, abort!")
+            sys.exit(1)
 
-              # Step 3: 修改 HMX eligibility 块，恢复真实 m 用于后续逻辑
-              t_old3 = ("    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
-                        "    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
-                        "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
-                        "            goto finalize;\n"
-                        "        }\n"
-                        "    }\n")
+    t_new2 = """    }
 
-              if tsrc.count(t_old3) != 1:
-                  print("ERROR: gemv_tile anchor3 (HMX block) not found, abort!")
-                  raise SystemExit(1)
+    // ===== GEMV TILE PATCH START =====
+    // Detect decode-phase M=1 GEMV and prepare to fake M=4 for HMX
+    bool gemv_tile_mode = false;
+    int  gemv_real_m    = m;
+    if (m == 1 && !is_matmul_id && !is_batched && sess->n_hmx > 0 && opt_mm_select >= 3) {
+        // Single-token decode GEMV: fake as M=4 to pass HMX threshold
+        gemv_tile_mode = true;
+        m = 4;  // fake M for HMX eligibility and precompute
+        GGML_LOG_INFO("ggml-hex: gemv_tile ACTIVATED real_m=1 fake_m=4\n");
+    }
+    // ===== GEMV TILE PATCH END =====
 
-              t_new3 = ("    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
-                        "    {\n"
-                        "        // gemv_tile: eligibility already passed with fake m=4 above\n"
-                        "        // Restore real m for correct parameter computation\n"
-                        "        if (gemv_tile_mode) {\n"
-                        "            GGML_LOG_INFO(\"ggml-hex: gemv_tile restoring real m=%d for precompute\\n\", gemv_real_m);\n"
-                        "        }\n"
-                        "        int saved_m = m;\n"
-                        "        if (gemv_tile_mode) { m = gemv_real_m; }\n"
-                        "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
-                        "        if (gemv_tile_mode) { m = saved_m; }\n"
-                        "        if (elig) {\n"
-                        "            if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
-                        "                if (gemv_tile_mode) {\n"
-                        "                    GGML_LOG_INFO(\"ggml-hex: gemv_tile HMX precompute OK\\n\");\n"
-                        "                }\n"
-                        "                goto finalize;\n"
-                        "            }\n"
-                        "        }\n"
-                        "    }\n")
+    // Check HMX eligibility and try precomputing HMX parameters
+"""
 
-              tsrc = tsrc.replace(t_old3, t_new3)
-              print("OK: gemv_tile HMX block patched")
+    tsrc = tsrc.replace(t_old2, t_new2)
+    print("OK: gemv_tile detection inserted")
 
-              # Step 4: 在 finalize 标签后插入结果过滤（保守版，只做日志不操作内存）
-              t_old4 = "finalize:\n"
-              if t_old4 not in tsrc:
-                  print("ERROR: gemv_tile anchor4 (finalize) not found, abort!")
-                  raise SystemExit(1)
+    # Step 3: 修改 HMX eligibility 块，恢复真实 m 用于后续逻辑
+    t_old3 = """    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
+        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
+            goto finalize;
+        }
+    }
+"""
 
-              finalize_idx = tsrc.index(t_old4)
-              nl_after = tsrc.index("\n", finalize_idx) + 1
+    if tsrc.count(t_old3) != 1:
+        print("ERROR: gemv_tile anchor3 (HMX block) not found, abort!")
+        sys.exit(1)
 
-              t_insert = ("    // GEMV TILE: result marker (no memory op to avoid crash)\n"
-                         "    if (gemv_tile_mode) {\n"
-                         "        GGML_LOG_INFO(\"ggml-hex: gemv_tile finalize reached for M=1 decode\\n\");\n"
-                         "        // NOTE: HMX computed 4 rows but only row 0 is valid.\n"
-                         "        // The kernel should have written correct row 0; rows 1-3 are garbage.\n"
-                         "        // Since dst is [N, M=1, 1, 1], only row 0 matters.\n"
-                         "    }\n"
-                         "\n")
+    t_new3 = """    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+    {
+        // gemv_tile: eligibility already passed with fake m=4 above
+        // Restore real m for correct parameter computation
+        if (gemv_tile_mode) {
+            GGML_LOG_INFO("ggml-hex: gemv_tile restoring real m=%d for precompute\n", gemv_real_m);
+        }
+        int saved_m = m;
+        if (gemv_tile_mode) { m = gemv_real_m; }
+        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);
+        if (gemv_tile_mode) { m = saved_m; }
+        if (elig) {
+            if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
+                if (gemv_tile_mode) {
+                    GGML_LOG_INFO("ggml-hex: gemv_tile HMX precompute OK\n");
+                }
+                goto finalize;
+            }
+        }
+    }
+"""
 
-              tsrc = tsrc[:nl_after] + t_insert + tsrc[nl_after:]
-              print("OK: gemv_tile finalize marker inserted")
+    tsrc = tsrc.replace(t_old3, t_new3)
+    print("OK: gemv_tile HMX block patched")
 
-              # Step 5: 确保有 stdio.h
-              if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
-                  idx = tsrc.index("#include")
-                  tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
-                  print("note: added #include <stdio.h>")
+    # Step 4: 在 finalize 标签后插入结果过滤（保守版，只做日志不操作内存）
+    t_old4 = "finalize:\n"
+    if t_old4 not in tsrc:
+        print("ERROR: gemv_tile anchor4 (finalize) not found, abort!")
+        sys.exit(1)
 
-              open(tpath, "w").write(tsrc)
-              print("OK: gemv_tile v2 fully applied")
-              raise SystemExit(0)
-          # ===================== GEMV TILE 补丁结束 =====================
+    finalize_idx = tsrc.index(t_old4)
+    nl_after = tsrc.index("\n", finalize_idx) + 1
 
-          print("ERROR: unknown patch_mode=" + mode)
-          raise SystemExit(1)
-          EOF
+    t_insert = """    // GEMV TILE: result marker (no memory op to avoid crash)
+    if (gemv_tile_mode) {
+        GGML_LOG_INFO("ggml-hex: gemv_tile finalize reached for M=1 decode\n");
+        // NOTE: HMX computed 4 rows but only row 0 is valid.
+        // The kernel should have written correct row 0; rows 1-3 are garbage.
+        // Since dst is [N, M=1, 1, 1], only row 0 matters.
+    }
+
+"""
+
+    tsrc = tsrc[:nl_after] + t_insert + tsrc[nl_after:]
+    print("OK: gemv_tile finalize marker inserted")
+
+    # Step 5: 确保有 stdio.h
+    if ("#include <stdio.h>" not in tsrc) and ("#include <cstdio>" not in tsrc):
+        idx = tsrc.index("#include")
+        tsrc = tsrc[:idx] + "#include <stdio.h>\n" + tsrc[idx:]
+        print("note: added #include <stdio.h>")
+
+    open(tpath, "w").write(tsrc)
+    print("OK: gemv_tile v3 fully applied")
+    sys.exit(0)
+# ===================== GEMV TILE 补丁结束 =====================
+
+print("ERROR: unknown patch_mode=" + mode)
+sys.exit(1)
+PYEOF
+          python3 /tmp/patch.py "${{ inputs.patch_mode }}"
           echo "=== 补丁验证 ==="
-          grep -n "gemv_tile\|SM8850 v81\|hmxdbg\|nospin"             llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp llama.cpp/ggml/src/ggml.c 2>/dev/null || true
+          grep -n "gemv_tile\|SM8850 v81\|hmxdbg\|nospin"             ggml/src/ggml-hexagon/ggml-hexagon.cpp ggml/src/ggml.c 2>/dev/null || true
 
       # ===================== 裸机工具链 =====================
       - name: 安装编译依赖工具
