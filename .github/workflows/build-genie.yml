@@ -10,6 +10,8 @@ jobs:
   package-genie:
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+
       - name: 安装工具
         run: |
           sudo apt update
@@ -38,12 +40,16 @@ jobs:
           cp "$SDK/bin/aarch64-android/genie-t2t-run" $OUT/
           # Android 侧全部 QNN/Genie 动态库 (HTP stub/CPU/saver/system 等)
           cp "$SDK/lib/aarch64-android/"*.so $OUT/
-          # DSP 侧 skel 库 (v73/v75/v79/v81 全带, SM8850 用 v81, 体积不大全打包省事)
+          # DSP 侧 skel 库 (只拷 *Skel*.so! hexagon 目录里的 libQnnSystem.so 是
+          # 32 位 DSP 格式, 全拷会覆盖 lib/aarch64-android 的 ARM64 版)
           for v in v73 v75 v79 v81; do
             if [ -d "$SDK/lib/hexagon-$v/unsigned" ]; then
-              cp "$SDK/lib/hexagon-$v/unsigned/"*.so $OUT/ 2>/dev/null || true
+              cp "$SDK/lib/hexagon-$v/unsigned/"*Skel*.so $OUT/ 2>/dev/null || true
             fi
           done
+          # 验证: libQnnSystem.so 必须是 ARM64
+          file $OUT/libQnnSystem.so | grep -q "aarch64" || { echo "::error::libQnnSystem.so 不是 aarch64!"; file $OUT/libQnnSystem.so; exit 1; }
+          echo "✅ libQnnSystem.so 架构正确"
           echo "=== 打包内容 ==="
           ls -la $OUT/
 
