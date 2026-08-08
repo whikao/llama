@@ -126,7 +126,7 @@ if mode in ("hmxfix", "hmxdbg"):
 """
         t_new2 = """    // Check HMX eligibility and try precomputing HMX parameters
     bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
-    GGML_LOG_INFO("ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\n", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));
+    GGML_LOG_INFO("ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\\n", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));
 """
         if tsrc.count(t_old2) != 1:
             print("ERROR: hmxdbg anchor2 not found, abort!")
@@ -156,7 +156,7 @@ if mode in ("hmxfix2", "hmxdbg2"):
         if (elig) {
             preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);
         }
-        fprintf(stderr, "ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
+        fprintf(stderr, "ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
         if (preok) {
             goto finalize;
         }
@@ -195,7 +195,7 @@ if mode in ("hmx2", "hmx2dbg"):
         if (elig) {
             preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);
         }
-        fprintf(stderr, "ggml-hex: hmx2dbg ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
+        fprintf(stderr, "ggml-hex: hmx2dbg ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);
         if (preok) {
             goto finalize;
         }
@@ -251,7 +251,7 @@ if mode == "gemv_tile":
         // Single-token decode GEMV: fake as M=4 to pass HMX threshold
         gemv_tile_mode = true;
         m = 4;  // fake M for HMX eligibility and precompute
-        GGML_LOG_INFO("ggml-hex: gemv_tile ACTIVATED real_m=1 fake_m=4\n");
+        GGML_LOG_INFO("ggml-hex: gemv_tile ACTIVATED real_m=1 fake_m=4\\n");
     }
     // ===== GEMV TILE PATCH END =====
 
@@ -279,7 +279,7 @@ if mode == "gemv_tile":
         // gemv_tile: eligibility already passed with fake m=4 above
         // Restore real m for correct parameter computation
         if (gemv_tile_mode) {
-            GGML_LOG_INFO("ggml-hex: gemv_tile restoring real m=%d for precompute\n", gemv_real_m);
+            GGML_LOG_INFO("ggml-hex: gemv_tile restoring real m=%d for precompute\\n", gemv_real_m);
         }
         int saved_m = m;
         if (gemv_tile_mode) { m = gemv_real_m; }
@@ -288,7 +288,7 @@ if mode == "gemv_tile":
         if (elig) {
             if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
                 if (gemv_tile_mode) {
-                    GGML_LOG_INFO("ggml-hex: gemv_tile HMX precompute OK\n");
+                    GGML_LOG_INFO("ggml-hex: gemv_tile HMX precompute OK\\n");
                 }
                 goto finalize;
             }
@@ -310,7 +310,7 @@ if mode == "gemv_tile":
 
     t_insert = """    // GEMV TILE: result marker (no memory op to avoid crash)
     if (gemv_tile_mode) {
-        GGML_LOG_INFO("ggml-hex: gemv_tile finalize reached for M=1 decode\n");
+        GGML_LOG_INFO("ggml-hex: gemv_tile finalize reached for M=1 decode\\n");
         // NOTE: HMX computed 4 rows but only row 0 is valid.
         // The kernel should have written correct row 0; rows 1-3 are garbage.
         // Since dst is [N, M=1, 1, 1], only row 0 matters.
