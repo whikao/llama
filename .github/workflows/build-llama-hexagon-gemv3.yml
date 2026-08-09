@@ -57,117 +57,74 @@ jobs:
           # (a) HMX 门槛全放，M=1 才能通过资格检查
           a1_old = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
           a1_new = "    if (m < 1) { // gemv_tile3: HMX for any M"
-          assert tsrc.count(a1_old) == 1, "anchor1 (threshold) not found"
+          assert tsrc.count(a1_old) == 1, "anchor1 threshold not found"
           tsrc = tsrc.replace(a1_old, a1_new)
 
-          # (b) 【核心修复】在 precompute 里把 ne11=1 前置伪造成 4：
-          #     kparams 的分块方案按 M=4 算，与后面张量描述符一致 → 不乱码
+          # (b) 核心修复：precompute 里 ne11=1 前置伪造成 4，kparams 按 M=4 算
           a2_old = "    const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);"
-          a2_new = ("""    const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
-"""
-                    """
-"""
-                    """    // ===== gemv_tile3: fake M=1 -> M=4 for kparams (env GGML_GEMV_TILE, 0=off) =====
-"""
-                    """    int ne11_eff = ne11;
-"""
-                    """    {
-"""
-                    """        static int opt_gemv_tile = -2;
-"""
-                    """        if (opt_gemv_tile == -2) {
-"""
-                    """            const char * e = getenv(\"GGML_GEMV_TILE\");
-"""
-                    """            opt_gemv_tile = e ? atoi(e) : 1;
-"""
-                    """        }
-"""
-                    """        if (opt_gemv_tile && !is_matmul_id && !is_batched &&
-"""
-                    """            ne11 == 1 && ne12 == 1 && ne13 == 1) {
-"""
-                    """            ne11_eff = 4;  // decode GEMV: plan HMX tiling as M=4
-"""
-                    """        }
-"""
-                    """    }""")
-          assert tsrc.count(a2_old) == 1, "anchor2 (is_batched) not found"
+          a2_new = "\n".join([
+              "    const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);",
+              "",
+              "    // ===== gemv_tile3: fake M=1 -> M=4 for kparams (env GGML_GEMV_TILE, 0=off) =====",
+              "    int ne11_eff = ne11;",
+              "    {",
+              "        static int opt_gemv_tile = -2;",
+              "        if (opt_gemv_tile == -2) {",
+              "            const char * e = getenv(\"GGML_GEMV_TILE\");",
+              "            opt_gemv_tile = e ? atoi(e) : 1;",
+              "        }",
+              "        if (opt_gemv_tile && !is_matmul_id && !is_batched &&",
+              "            ne11 == 1 && ne12 == 1 && ne13 == 1) {",
+              "            ne11_eff = 4;  // decode GEMV: plan HMX tiling as M=4",
+              "        }",
+              "    }"])
+          assert tsrc.count(a2_old) == 1, "anchor2 is_batched not found"
           tsrc = tsrc.replace(a2_old, a2_new)
 
           # (c) precompute_hmx_mm_params 调用改用 ne11_eff
           a3_old = "ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)"
           a3_new = "ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11_eff, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)"
-          assert tsrc.count(a3_old) == 1, "anchor3 (hmx precompute call) not found"
+          assert tsrc.count(a3_old) == 1, "anchor3 hmx precompute call not found"
           tsrc = tsrc.replace(a3_old, a3_new)
 
-          # (d) add_op 交付 DSP 前伪造张量描述符（仅当 HMX 真正被选中，
-          #     n_hmx==1；HVX 兜底时不动 → 保证正确性）
-          a4_old = ("""        auto outputs = node.get_outputs();
-"""
-                    """        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
-"""
-                    """            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
-"""
-                    """        }
-"""
-                    """    }""")
-          a4_new = ("""        auto outputs = node.get_outputs();
-"""
-                    """        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
-"""
-                    """            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
-"""
-                    """        }
-"""
-                    """
-"""
-                    """        // ===== gemv_tile3: zero-stride fake M=4 descriptors (HMX only) =====
-"""
-                    """        {
-"""
-                    """            static int opt_gemv_tile_op = -2;
-"""
-                    """            if (opt_gemv_tile_op == -2) {
-"""
-                    """                const char * e = getenv(\"GGML_GEMV_TILE\");
-"""
-                    """                opt_gemv_tile_op = e ? atoi(e) : 1;
-"""
-                    """            }
-"""
-                    """            const htp_mm_kernel_params * kp = (const htp_mm_kernel_params *) node.kernel_params;
-"""
-                    """            if (opt_gemv_tile_op && o.opcode == HTP_OP_MUL_MAT && kp->n_hmx == 1 &&
-"""
-                    """                inputs.size() >= 2 && inputs[0] && inputs[1] &&
-"""
-                    """                outputs.size() >= 1 && outputs[0]) {
-"""
-                    """                const ggml_tensor * s1 = inputs[1];
-"""
-                    """                const ggml_tensor * d0 = outputs[0];
-"""
-                    """                if (s1->ne[1] == 1 && s1->ne[2] == 1 && s1->ne[3] == 1 &&
-"""
-                    """                    d0->ne[1] == 1 && o.src[1] != 0xffff && o.dst[0] != 0xffff) {
-"""
-                    """                    htp_tensor & hs = h_tens[o.src[1]];
-"""
-                    """                    htp_tensor & hd = h_tens[o.dst[0]];
-"""
-                    """                    hs.ne[1] = 4; hs.nb[1] = 0; hs.nb[2] = 0; hs.nb[3] = 0;
-"""
-                    """                    hd.ne[1] = 4; hd.nb[1] = 0; hd.nb[2] = 0; hd.nb[3] = 0;
-"""
-                    """                }
-"""
-                    """            }
-"""
-                    """        }
-"""
-                    """    }""")
-          assert tsrc.count(a4_old) == 1, "anchor4 (add_op tail) not found"
+          # (d) add_op 伪造张量描述符：仅当 HMX 真正被选中(n_hmx==1)才动，
+          #     HVX 兜底保持原样 → 不会乱码
+          a4_old = "\n".join([
+              "        auto outputs = node.get_outputs();",
+              "        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {",
+              "            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;",
+              "        }",
+              "    }"])
+          a4_new = "\n".join([
+              "        auto outputs = node.get_outputs();",
+              "        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {",
+              "            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;",
+              "        }",
+              "",
+              "        // ===== gemv_tile3: zero-stride fake M=4 descriptors (HMX only) =====",
+              "        {",
+              "            static int opt_gemv_tile_op = -2;",
+              "            if (opt_gemv_tile_op == -2) {",
+              "                const char * e = getenv(\"GGML_GEMV_TILE\");",
+              "                opt_gemv_tile_op = e ? atoi(e) : 1;",
+              "            }",
+              "            const htp_mm_kernel_params * kp = (const htp_mm_kernel_params *) node.kernel_params;",
+              "            if (opt_gemv_tile_op && o.opcode == HTP_OP_MUL_MAT && kp->n_hmx == 1 &&",
+              "                inputs.size() >= 2 && inputs[0] && inputs[1] &&",
+              "                outputs.size() >= 1 && outputs[0]) {",
+              "                const ggml_tensor * s1 = inputs[1];",
+              "                const ggml_tensor * d0 = outputs[0];",
+              "                if (s1->ne[1] == 1 && s1->ne[2] == 1 && s1->ne[3] == 1 &&",
+              "                    d0->ne[1] == 1 && o.src[1] != 0xffff && o.dst[0] != 0xffff) {",
+              "                    htp_tensor & hs = h_tens[o.src[1]];",
+              "                    htp_tensor & hd = h_tens[o.dst[0]];",
+              "                    hs.ne[1] = 4; hs.nb[1] = 0; hs.nb[2] = 0; hs.nb[3] = 0;",
+              "                    hd.ne[1] = 4; hd.nb[1] = 0; hd.nb[2] = 0; hd.nb[3] = 0;",
+              "                }",
+              "            }",
+              "        }",
+              "    }"])
+          assert tsrc.count(a4_old) == 1, "anchor4 add_op tail not found"
           tsrc = tsrc.replace(a4_old, a4_new)
 
           open(tpath, "w").write(tsrc)
