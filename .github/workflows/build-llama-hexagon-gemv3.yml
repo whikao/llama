@@ -1,0 +1,226 @@
+# ============================================================
+# build-llama-hexagon.yml
+# llama.cpp Snapdragon 全后端构建（CPU + Hexagon HTP NPU（无 Vulkan/OpenCL））
+# 放在仓库 .github/workflows/ 下，Actions 页手动点 "Run workflow" 触发
+#
+# 产物（Release: llama-snapdragon-latest / Actions artifact）：
+#   llama-snapdragon.tar.gz
+#     ├── bin/  llama-server（自带WebUI+MCP）、llama-mtmd-cli（识图）、llama-cli、llama-bench…
+#     └── lib/  libggml-hexagon.so、libggml-htp-v73/75/79/81.so（NPU skel）、libggml-htp-v81.so 等…
+#
+# 构建环境：官方 snapdragon-toolchain Docker 镜像（内置 Android NDK +
+#           OpenCL SDK + Hexagon SDK，无需高通账号，无需任何 secret）
+# ============================================================
+
+name: build-llama-hexagon-gemv3
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp 分支/tag/commit（留空 = master 最新）'
+        required: false
+        default: ''
+      toolchain_tag:
+        description: 'snapdragon-toolchain 镜像 tag'
+        required: false
+        default: 'v0.7'
+        # 查看最新 tag: https://github.com/snapdragon-toolchain/arm64-android/pkgs/container/arm64-android
+
+permissions:
+  contents: write   # 用于发布 Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取 llama.cpp 源码
+        run: |
+          REF="$(echo '${{ github.event.inputs.llama_ref }}' | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
+          else
+            git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
+            cd llama.cpp && git checkout "$REF" && cd ..
+          fi
+          cd llama.cpp && echo "LLAMA_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+
+      # ===================== gemv_tile3 补丁（编译前） =====================
+      - name: 打 gemv_tile3 补丁（M=1 GEMV 前置伪造 M=4，kparams 与张量一致）
+        run: |
+          cd llama.cpp
+          python3 - << 'EOF'
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          # (a) HMX 门槛全放，M=1 才能通过资格检查
+          a1_old = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+          a1_new = "    if (m < 1) { // gemv_tile3: HMX for any M"
+          assert tsrc.count(a1_old) == 1, "anchor1 (threshold) not found"
+          tsrc = tsrc.replace(a1_old, a1_new)
+
+          # (b) 【核心修复】在 precompute 里把 ne11=1 前置伪造成 4：
+          #     kparams 的分块方案按 M=4 算，与后面张量描述符一致 → 不乱码
+          a2_old = "    const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);"
+          a2_new = ("""    const bool is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
+"""
+                    """
+"""
+                    """    // ===== gemv_tile3: fake M=1 -> M=4 for kparams (env GGML_GEMV_TILE, 0=off) =====
+"""
+                    """    int ne11_eff = ne11;
+"""
+                    """    {
+"""
+                    """        static int opt_gemv_tile = -2;
+"""
+                    """        if (opt_gemv_tile == -2) {
+"""
+                    """            const char * e = getenv(\"GGML_GEMV_TILE\");
+"""
+                    """            opt_gemv_tile = e ? atoi(e) : 1;
+"""
+                    """        }
+"""
+                    """        if (opt_gemv_tile && !is_matmul_id && !is_batched &&
+"""
+                    """            ne11 == 1 && ne12 == 1 && ne13 == 1) {
+"""
+                    """            ne11_eff = 4;  // decode GEMV: plan HMX tiling as M=4
+"""
+                    """        }
+"""
+                    """    }""")
+          assert tsrc.count(a2_old) == 1, "anchor2 (is_batched) not found"
+          tsrc = tsrc.replace(a2_old, a2_new)
+
+          # (c) precompute_hmx_mm_params 调用改用 ne11_eff
+          a3_old = "ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)"
+          a3_new = "ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11_eff, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)"
+          assert tsrc.count(a3_old) == 1, "anchor3 (hmx precompute call) not found"
+          tsrc = tsrc.replace(a3_old, a3_new)
+
+          # (d) add_op 交付 DSP 前伪造张量描述符（仅当 HMX 真正被选中，
+          #     n_hmx==1；HVX 兜底时不动 → 保证正确性）
+          a4_old = ("""        auto outputs = node.get_outputs();
+"""
+                    """        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
+"""
+                    """            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
+"""
+                    """        }
+"""
+                    """    }""")
+          a4_new = ("""        auto outputs = node.get_outputs();
+"""
+                    """        for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
+"""
+                    """            o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
+"""
+                    """        }
+"""
+                    """
+"""
+                    """        // ===== gemv_tile3: zero-stride fake M=4 descriptors (HMX only) =====
+"""
+                    """        {
+"""
+                    """            static int opt_gemv_tile_op = -2;
+"""
+                    """            if (opt_gemv_tile_op == -2) {
+"""
+                    """                const char * e = getenv(\"GGML_GEMV_TILE\");
+"""
+                    """                opt_gemv_tile_op = e ? atoi(e) : 1;
+"""
+                    """            }
+"""
+                    """            const htp_mm_kernel_params * kp = (const htp_mm_kernel_params *) node.kernel_params;
+"""
+                    """            if (opt_gemv_tile_op && o.opcode == HTP_OP_MUL_MAT && kp->n_hmx == 1 &&
+"""
+                    """                inputs.size() >= 2 && inputs[0] && inputs[1] &&
+"""
+                    """                outputs.size() >= 1 && outputs[0]) {
+"""
+                    """                const ggml_tensor * s1 = inputs[1];
+"""
+                    """                const ggml_tensor * d0 = outputs[0];
+"""
+                    """                if (s1->ne[1] == 1 && s1->ne[2] == 1 && s1->ne[3] == 1 &&
+"""
+                    """                    d0->ne[1] == 1 && o.src[1] != 0xffff && o.dst[0] != 0xffff) {
+"""
+                    """                    htp_tensor & hs = h_tens[o.src[1]];
+"""
+                    """                    htp_tensor & hd = h_tens[o.dst[0]];
+"""
+                    """                    hs.ne[1] = 4; hs.nb[1] = 0; hs.nb[2] = 0; hs.nb[3] = 0;
+"""
+                    """                    hd.ne[1] = 4; hd.nb[1] = 0; hd.nb[2] = 0; hd.nb[3] = 0;
+"""
+                    """                }
+"""
+                    """            }
+"""
+                    """        }
+"""
+                    """    }""")
+          assert tsrc.count(a4_old) == 1, "anchor4 (add_op tail) not found"
+          tsrc = tsrc.replace(a4_old, a4_new)
+
+          open(tpath, "w").write(tsrc)
+          print("OK: gemv_tile3 applied (threshold + ne11_eff precompute + HMX-gated descriptors)")
+          EOF
+          echo "=== 补丁验证 ==="
+          grep -n "gemv_tile3" llama.cpp/ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -5
+
+      - name: 在官方工具链容器内构建（Hexagon HTP + OpenCL + CPU）
+        run: |
+          docker run --platform linux/amd64 \
+            -v "$PWD/llama.cpp":/workspace -w /workspace \
+            ghcr.io/snapdragon-toolchain/arm64-android:${{ github.event.inputs.toolchain_tag }} \
+            bash -euxo pipefail -c '
+              apt-get update -qq && apt-get install -y -qq make g++
+              git config --global --add safe.directory /workspace
+              cp docs/backend/snapdragon/CMakeUserPresets.json .
+              # OpenCL 在未 root 设备上无法枚举平台且会注册坏设备 → 关闭
+              # Vulkan/OpenCL 均关闭：纯 HTP+CPU（实测 Vulkan 抢屏幕资源不可用）
+              # march 提到 armv9.2a+sve2：8 Elite Gen5（Oryon）实测支持（whisper.cpp 同款已验证）
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon \
+                -DGGML_OPENCL=OFF -DGGML_VULKAN=OFF \
+                -DCMAKE_C_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE" \
+                -DCMAKE_CXX_FLAGS="-march=armv9.2a+fp16+dotprod+i8mm+sve2+sme -fvectorize -ffp-model=fast -fno-finite-math-only -flto -D_GNU_SOURCE"
+              cmake --build build-snapdragon -j"$(nproc)"
+              cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
+            '
+
+      - name: 打包产物
+        run: |
+          cd llama.cpp/pkg-snapdragon
+          tar czf ../../llama-snapdragon.tar.gz llama.cpp
+          cd ../..
+          ls -lh llama-snapdragon.tar.gz
+          tar tzf llama-snapdragon.tar.gz | grep -E 'bin/llama-(server|mtmd-cli)|libggml-htp' || true
+
+      - name: 上传 Actions artifact（保留 14 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-snapdragon-${{ env.LLAMA_COMMIT }}
+          path: llama-snapdragon.tar.gz
+          retention-days: 14
+
+      - name: 发布/更新 Release（手机端固定下载地址）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llama-snapdragon-latest
+          name: llama.cpp snapdragon (CPU+Vulkan+Hexagon) ${{ env.LLAMA_COMMIT }}
+          body: |
+            llama.cpp commit: ${{ env.LLAMA_COMMIT }}
+            后端：CPU / Adreno Vulkan / Hexagon HTP（v73/v75/v79/v81）
+            Termux 侧用 setup.sh 一键下载解压本资产。
+          files: llama-snapdragon.tar.gz
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
