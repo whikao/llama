@@ -25,18 +25,20 @@ jobs:
             ghcr.io/snapdragon-toolchain/arm64-android:v0.3 \
             bash -c "
               set -e &&
-              echo '--- ensuring host libc headers exist ---' &&
+              git config --global --add safe.directory /workspace &&
               (apt-get update && apt-get install -y libc6-dev) || true &&
-              echo '--- locating real host inttypes.h ---' &&
-              HOSTHDR=\$(find /usr/include -maxdepth 2 -iname 'inttypes.h' ! -path '*android*' 2>/dev/null | head -n1 | xargs -r dirname) &&
-              echo \"host include dir: \$HOSTHDR\" &&
-              if [ -z \"\$HOSTHDR\" ]; then echo 'still not found, aborting'; exit 1; fi &&
-              export CPLUS_INCLUDE_PATH=\"\$HOSTHDR\" &&
-              export C_INCLUDE_PATH=\"\$HOSTHDR\" &&
               cd /workspace &&
               PRESET_FILE=\$(find docs -iname 'CMakeUserPresets.json' | head -n1) &&
               cp \"\$PRESET_FILE\" . &&
+              echo '=== stage 1: normal configure + build (no env override) ===' &&
               cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
+              cmake --build build-snapdragon -j\$(nproc) -- -k 0 || true &&
+              echo '=== stage 2: fix the one broken host tool only ===' &&
+              HOSTHDR=\$(find /usr/include -maxdepth 2 -iname 'inttypes.h' ! -path '*android*' 2>/dev/null | head -n1 | xargs -r dirname) &&
+              echo \"host include dir: \$HOSTHDR\" &&
+              CPLUS_INCLUDE_PATH=\"\$HOSTHDR\" C_INCLUDE_PATH=\"\$HOSTHDR\" \
+                cmake --build build-snapdragon --target llama-ui-embed-host &&
+              echo '=== stage 3: resume full build now that stage 2 unblocked it ===' &&
               cmake --build build-snapdragon -j\$(nproc) &&
               echo '--- key binaries ---' &&
               ls -la build-snapdragon/bin/llama-cli
