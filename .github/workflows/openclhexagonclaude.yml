@@ -33,7 +33,7 @@ jobs:
               echo \"Using preset file: \$PRESET_FILE\" &&
               cp \"\$PRESET_FILE\" . &&
               cmake --list-presets &&
-              cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon -DLLAMA_BUILD_UI=OFF &&
               cmake --build build-snapdragon -j\$(nproc)
             "
 
