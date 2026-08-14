@@ -25,24 +25,31 @@ jobs:
             --volume ${{ github.workspace }}/llama.cpp:/workspace \
             ghcr.io/snapdragon-toolchain/arm64-android:v0.3 \
             bash -c "
+              set -e &&
               cd /workspace &&
+              echo '--- locating real host inttypes.h ---' &&
+              HOSTHDR=\$(dirname \$(find /usr/include -maxdepth 1 -iname 'inttypes.h' 2>/dev/null | head -n1)) &&
+              echo \"host include dir: \$HOSTHDR\" &&
+              export CPLUS_INCLUDE_PATH=\"\$HOSTHDR\" &&
+              export C_INCLUDE_PATH=\"\$HOSTHDR\" &&
               PRESET_FILE=\$(find docs -iname 'CMakeUserPresets.json' | head -n1) &&
-              echo \"Using preset file: \$PRESET_FILE\" &&
               cp \"\$PRESET_FILE\" . &&
               cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
-              cmake --build build-snapdragon -j\$(nproc) -- -k 0 || true &&
-              echo '--- checking key binaries ---' &&
-              ls -la build-snapdragon/bin/llama-cli 2>&1 || true &&
-              ls -la build-snapdragon/bin/llama-server 2>&1 || true &&
-              echo '--- checking backend libs ---' &&
-              find build-snapdragon -iname '*hexagon*' -o -iname '*opencl*' 2>&1 || true
+              cmake --build build-snapdragon -j\$(nproc) &&
+              echo '--- key binaries ---' &&
+              ls -la build-snapdragon/bin/llama-cli &&
+              echo '--- runtime deps of llama-cli ---' &&
+              (/opt/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readobj --needed-libs build-snapdragon/bin/llama-cli || true)
             "
 
-      - name: Package artifacts
+      - name: Package artifacts (only what's needed to run)
         run: |
           mkdir -p out
-          cp -r llama.cpp/build-snapdragon/bin out/ 2>/dev/null || true
-          find llama.cpp/build-snapdragon -name "*.so" -exec cp {} out/ \; 2>/dev/null || true
+          cp llama.cpp/build-snapdragon/bin/llama-cli out/
+          find llama.cpp/build-snapdragon -iname "libggml*.so" -exec cp {} out/ \;
+          find llama.cpp/build-snapdragon -iname "libllama*.so" -exec cp {} out/ \;
+          find llama.cpp/build-snapdragon -iname "libggml-htp-*.so" -exec cp {} out/ \;
+          ls -la out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
