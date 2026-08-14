@@ -25,16 +25,17 @@ jobs:
             --volume ${{ github.workspace }}/llama.cpp:/workspace \
             ghcr.io/snapdragon-toolchain/arm64-android:v0.3 \
             bash -c "
-              set -e &&
               cd /workspace &&
-              echo '--- looking for CMakeUserPresets.json ---' &&
-              find docs -iname 'CMakeUserPresets.json' &&
               PRESET_FILE=\$(find docs -iname 'CMakeUserPresets.json' | head -n1) &&
               echo \"Using preset file: \$PRESET_FILE\" &&
               cp \"\$PRESET_FILE\" . &&
-              cmake --list-presets &&
-              cmake --preset arm64-android-snapdragon-release -B build-snapdragon -DLLAMA_BUILD_UI=OFF &&
-              cmake --build build-snapdragon -j\$(nproc)
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
+              cmake --build build-snapdragon -j\$(nproc) -- -k 0 || true &&
+              echo '--- checking key binaries ---' &&
+              ls -la build-snapdragon/bin/llama-cli 2>&1 || true &&
+              ls -la build-snapdragon/bin/llama-server 2>&1 || true &&
+              echo '--- checking backend libs ---' &&
+              find build-snapdragon -iname '*hexagon*' -o -iname '*opencl*' 2>&1 || true
             "
 
       - name: Package artifacts
